@@ -41,6 +41,7 @@
     document.getElementById('menuBtn')?.addEventListener('click', Layout.toggleSidebar);
 
     populateCategorySelect(document.getElementById('categoryFilter'), true);
+    populateGroupFilter(document.getElementById('groupFilter'));
 
     await Promise.all([loadStats(), loadExpenses(), loadSiteFilter()]);
     wireFilters();
@@ -118,6 +119,17 @@
     `).join('');
   }
 
+  const EXPORT_GROUP_ORDER = ['Hotel', 'Accommodation', 'Materials', 'PPE', 'Labour_Workmanship', 'Utilities', 'Security_Storekeeper', 'Other'];
+
+  function populateGroupFilter(selectEl) {
+    EXPORT_GROUP_ORDER.forEach(g => {
+      const opt = document.createElement('option');
+      opt.value = g;
+      opt.textContent = EXPORT_GROUP_LABELS[g] || g;
+      selectEl.appendChild(opt);
+    });
+  }
+
   async function loadSiteFilter() {
     try {
       const data = await Api.getSites();
@@ -171,6 +183,7 @@
     const q = (document.getElementById('searchBox').value || '').toLowerCase();
     const site = document.getElementById('siteFilter').value;
     const cat = document.getElementById('categoryFilter').value;
+    const group = document.getElementById('groupFilter').value;
     const from = document.getElementById('fromDate').value;
     const to = document.getElementById('toDate').value;
 
@@ -181,6 +194,7 @@
       }
       if (site && e.Site !== site) return false;
       if (cat && e.Category !== cat) return false;
+      if (group && (EXPORT_GROUP_MAP[e.Category] || 'Other') !== group) return false;
       const d = isoDate(e.Date);
       if (from && d < from) return false;
       if (to && d > to) return false;
@@ -191,7 +205,7 @@
 
   function wireFilters() {
     document.getElementById('searchBox').addEventListener('input', applyFilters);
-    ['siteFilter', 'categoryFilter', 'fromDate', 'toDate'].forEach(id => {
+    ['siteFilter', 'categoryFilter', 'groupFilter', 'fromDate', 'toDate'].forEach(id => {
       document.getElementById(id).addEventListener('input', applyFilters);
       document.getElementById(id).addEventListener('change', applyFilters);
     });
@@ -199,24 +213,76 @@
 
   function wireExport() {
     document.getElementById('exportExcelBtn').addEventListener('click', () => {
-      const rows = filtered.map(e => ({
-        'Expense ID': e['Expense ID'], Date: fmtDate(e.Date), Site: e.Site, Category: e.Category,
-        Description: e.Description, Amount: e.Amount, Vendor: e.Vendor,
-        'Payment Method': e['Payment Method'], 'Submitted By': e['Submitted By']
-      }));
-      const ws = XLSX.utils.json_to_sheet(rows);
+      if (!filtered.length) { showToast('No expenses to export for the current filters', 'error'); return; }
+
+      // File each expense into the client's export sheet names (Hotel,
+      // Accommodation, Materials, PPE, Labour_Workmanship, Utilities,
+      // Security_Storekeeper, Other) — independent of the dropdown groups.
+      const byGroup = {};
+      filtered.forEach(e => {
+        const g = EXPORT_GROUP_MAP[e.Category] || 'Other';
+        (byGroup[g] = byGroup[g] || []).push(e);
+      });
+      const groupOrder = EXPORT_GROUP_ORDER.filter(g => byGroup[g] && byGroup[g].length);
+
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Expenses');
+      const NGN = '"₦"#,##0';
+
+      // ---- Summary sheet ----
+      const summaryAoa = [['Category Group', 'Transactions', 'Total (₦)']];
+      let grandTotal = 0, grandCount = 0;
+      groupOrder.forEach(g => {
+        const rows = byGroup[g];
+        const total = rows.reduce((s, e) => s + (Number(e.Amount) || 0), 0);
+        grandTotal += total; grandCount += rows.length;
+        summaryAoa.push([EXPORT_GROUP_LABELS[g] || g, rows.length, total]);
+      });
+      summaryAoa.push(['GRAND TOTAL', grandCount, grandTotal]);
+
+      const summaryWs = XLSX.utils.aoa_to_sheet(summaryAoa);
+      summaryWs['!cols'] = [{ wch: 26 }, { wch: 14 }, { wch: 18 }];
+      for (let r = 2; r <= summaryAoa.length; r++) {
+        const cell = summaryWs['C' + r];
+        if (cell) cell.z = NGN;
+      }
+      XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
+
+      // ---- One sheet per category group ----
+      const cols = ['Expense ID', 'Date', 'Site', 'Category', 'Description', 'Amount', 'Vendor', 'Payment Method', 'Submitted By'];
+      groupOrder.forEach(g => {
+        const rows = byGroup[g];
+        const total = rows.reduce((s, e) => s + (Number(e.Amount) || 0), 0);
+        const aoa = [cols];
+        rows.forEach(e => aoa.push([
+          e['Expense ID'], fmtDate(e.Date), e.Site, e.Category, e.Description,
+          Number(e.Amount) || 0, e.Vendor || '', e['Payment Method'] || '', e['Submitted By'] || ''
+        ]));
+        aoa.push(['', '', '', '', 'TOTAL', total, '', '', '']);
+
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        ws['!cols'] = [{ wch: 16 }, { wch: 12 }, { wch: 14 }, { wch: 18 }, { wch: 30 }, { wch: 14 }, { wch: 18 }, { wch: 14 }, { wch: 14 }];
+        for (let r = 2; r <= aoa.length; r++) {
+          const cell = ws['F' + r];
+          if (cell) cell.z = NGN;
+        }
+        const sheetName = g.replace(/[:\\\/\?\*\[\]]/g, '').slice(0, 31);
+        XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      });
+
       XLSX.writeFile(wb, 'site-expenses-' + new Date().toISOString().slice(0, 10) + '.xlsx');
     });
 
     document.getElementById('exportPdfBtn').addEventListener('click', () => {
+      if (!filtered.length) { showToast('No expenses to export for the current filters', 'error'); return; }
+
+      const grandTotal = filtered.reduce((s, e) => s + (Number(e.Amount) || 0), 0);
+
       const { jsPDF } = window.jspdf;
       const doc = new jsPDF({ orientation: 'landscape' });
       doc.setFontSize(14);
       doc.text('Site Expense Report', 14, 16);
       doc.setFontSize(9);
-      doc.text('Generated ' + new Date().toLocaleString(), 14, 22);
+      doc.text('Generated ' + new Date().toLocaleString() + '  ·  ' + filtered.length + ' transactions  ·  Total: ' + money(grandTotal), 14, 22);
       doc.autoTable({
         startY: 28,
         head: [['ID', 'Date', 'Site', 'Category', 'Description', 'Amount', 'Vendor', 'Payment', 'By']],
@@ -224,8 +290,10 @@
           e['Expense ID'], fmtDate(e.Date), e.Site, e.Category, e.Description,
           money(e.Amount), e.Vendor || '—', e['Payment Method'] || '—', e['Submitted By'] || ''
         ]),
+        foot: [['', '', '', '', 'TOTAL', money(grandTotal), '', '', '']],
         styles: { fontSize: 8 },
-        headStyles: { fillColor: [22, 86, 245] }
+        headStyles: { fillColor: [22, 86, 245] },
+        footStyles: { fillColor: [240, 242, 247], textColor: [20, 20, 20], fontStyle: 'bold' }
       });
       doc.save('site-expenses-' + new Date().toISOString().slice(0, 10) + '.pdf');
     });
